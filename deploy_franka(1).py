@@ -11,8 +11,7 @@ import json_numpy
 from PIL import Image
 from scipy.spatial.transform import Rotation as R
 from transformers import AutoModelForVision2Seq, AutoProcessor
-import panda_py.controllers
-import panda_py
+import pylibfranka
 import pyrealsense2 as rs
 import os
 
@@ -122,6 +121,64 @@ def get_resized_frame(pipeline, width=400, height=400):
     return resized_image
 
 
+def get_current_pose(robot):
+    """Get current end-effector position and orientation from robot."""
+    try:
+        state = robot.read_once()
+        # O_T_EE is column-major 16-element array, convert to 4x4 row-major
+        O_T_EE = state.O_T_EE.reshape(4, 4).T
+        translation = O_T_EE[:3, 3]
+        rotation_matrix = O_T_EE[:3, :3]
+        # Convert to quaternion
+        orientation_quat = R.from_matrix(rotation_matrix).as_quat()
+        return translation, orientation_quat
+    except Exception as e:
+        logging.error(f"Error reading robot pose: {e}")
+        raise
+
+
+def move_to_joint_position(robot, target_q, steps=100):
+    """Move robot to target joint position using simple control loop."""
+    try:
+        target_q = np.array(target_q)
+        control = robot.start_joint_position_control(pylibfranka.ControllerMode.JointImpedance)
+        
+        for i in range(steps):
+            state, duration = control.readOnce()
+            command = pylibfranka.JointPositions(target_q)
+            control.writeOnce(command)
+            time.sleep(0.001)  # Approximate 1 kHz
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error moving to joint position: {e}")
+        return False
+
+
+def move_to_pose(robot, translation, orientation_quat, steps=50):
+    """Move robot to target Cartesian pose using simple control loop."""
+    try:
+        # Build 4x4 transformation matrix
+        target_T = np.eye(4)
+        target_T[:3, 3] = translation
+        target_T[:3, :3] = R.from_quat(orientation_quat).as_matrix()
+        # Convert to column-major format (flatten transposed)
+        target_T_col_major = target_T.T.flatten()
+        
+        control = robot.start_cartesian_pose_control(pylibfranka.ControllerMode.CartesianImpedance)
+        
+        for i in range(steps):
+            state, duration = control.readOnce()
+            command = pylibfranka.CartesianPose(target_T_col_major)
+            control.writeOnce(command)
+            time.sleep(0.001)  # Approximate 1 kHz
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error moving to pose: {e}")
+        return False
+
+
 # def get_next_image(width=224, height=224):
 #     """Reads the next image from the directory and resizes it."""
 #     global image_index
@@ -139,23 +196,44 @@ def get_resized_frame(pipeline, width=400, height=400):
 
 
 def init_robot(robot, gripper):
+    """Initialize robot to home position."""
     joint_pose = [-0.01588696, -0.25534376, 0.18628714, -
                   2.28398158, 0.0769999, 2.02505396, 0.07858208]
-
-    robot.move_to_joint_position(joint_pose)
-    gripper.move(width=0.8, speed=0.1)
+    
+    try:
+        move_to_joint_position(robot, joint_pose)
+        success = gripper.move(width=0.8, speed=0.1)
+        if not success:
+            logging.warning("Gripper move command failed")
+    except Exception as e:
+        logging.error(f"Error initializing robot: {e}")
+        raise
 
 
 def main():
-    """Main function to initialize robot, camera, and run naconda3/envs/openvla/bin/python      15286Miaction prediction in a loop."""
+    """Main function to initialize robot, camera, and run action prediction in a loop."""
     hostname = '172.16.0.2'
-    robot = panda_py.Panda(hostname)
-    gripper = panda_py.libfranka.Gripper(hostname)
-    robot.recover()
+    
+    # Initialize robot and gripper with pylibfranka
+    try:
+        robot = pylibfranka.Robot(hostname, pylibfranka.RealtimeConfig.kIgnore)
+        gripper = pylibfranka.Gripper(hostname)
+        robot.automatic_error_recovery()
+        logging.info("Robot and gripper initialized successfully")
+    except Exception as e:
+        logging.error(f"Failed to initialize robot: {e}")
+        return
+    
+    # Optionally initialize robot to home position
     # init_robot(robot, gripper=gripper)
 
-    current_translation = robot.get_position()
-    current_rotation = robot.get_orientation()
+    # Get current pose
+    try:
+        current_translation, current_rotation = get_current_pose(robot)
+    except Exception as e:
+        logging.error(f"Failed to read initial pose: {e}")
+        return
+    
     pipeline, profile = initialize_camera()
 
     # Initialize OpenVLA Controller
@@ -190,39 +268,63 @@ def main():
         # time.sleep(2)
 
         if "error" not in action:
-            # Update position and orientation based on action
-            if 'dpos_x' in action and 'dpos_y' in action and 'dpos_z' in action:
-                current_translation += np.array([
-                    action['dpos_x'],
-                    action['dpos_y'],
-                    action['dpos_z']
-                ])
-            if 'drot_x' in action and 'drot_y' in action and 'drot_z' in action:
-                euler_angles = np.array([
-                    action['drot_x'],
-                    action['drot_y'],
-                    action['drot_z']
-                ])
-                rotation_increment = R.from_euler(
-                    'xyz', euler_angles).as_quat()
-                rotation_increment[:] = [0, 0, 0, 1]
-                current_rotation = R.from_quat(
-                    current_rotation) * R.from_quat(rotation_increment)
-                current_rotation = current_rotation.as_quat()
+            try:
+                # Update position and orientation based on action
+                if 'dpos_x' in action and 'dpos_y' in action and 'dpos_z' in action:
+                    current_translation += np.array([
+                        action['dpos_x'],
+                        action['dpos_y'],
+                        action['dpos_z']
+                    ])
+                if 'drot_x' in action and 'drot_y' in action and 'drot_z' in action:
+                    euler_angles = np.array([
+                        action['drot_x'],
+                        action['drot_y'],
+                        action['drot_z']
+                    ])
+                    rotation_increment = R.from_euler(
+                        'xyz', euler_angles).as_quat()
+                    rotation_increment[:] = [0, 0, 0, 1]
+                    current_rotation = R.from_quat(
+                        current_rotation) * R.from_quat(rotation_increment)
+                    current_rotation = current_rotation.as_quat()
 
-            # Move the robot to the new pose
-            robot.move_to_pose(current_translation, current_rotation)
+                # Move the robot to the new pose
+                success = move_to_pose(robot, current_translation, current_rotation)
+                if not success:
+                    logging.warning("Failed to execute pose movement")
+                    # Try to recover
+                    robot.automatic_error_recovery()
+                    current_translation, current_rotation = get_current_pose(robot)
 
-            # Control the gripper based on the grip_command
-            if 'grip_command' in action:
-                if action['grip_command'] == 'close':
-                    if gripper.read_once().is_grasped:
-                        pass
-                    else:
-                        gripper.grasp(0.002, 0.2, 10, 0.04, 0.04)
-
-                elif action['grip_command'] == 'open':
-                    gripper.move(0.8, 0.2)
+                # Control the gripper based on the grip_command
+                if 'grip_command' in action:
+                    try:
+                        if action['grip_command'] == 'close':
+                            gripper_state = gripper.read_once()
+                            if not gripper_state.is_grasped:
+                                success = gripper.grasp(0.002, 0.2, 10, 0.04, 0.04)
+                                if not success:
+                                    logging.warning("Grasp command failed")
+                        elif action['grip_command'] == 'open':
+                            success = gripper.move(0.8, 0.2)
+                            if not success:
+                                logging.warning("Gripper open command failed")
+                    except Exception as e:
+                        logging.error(f"Gripper control error: {e}")
+                        
+            except (pylibfranka.NetworkException, pylibfranka.ControlException, 
+                    pylibfranka.CommandException) as e:
+                logging.error(f"Robot control error: {e}")
+                try:
+                    robot.automatic_error_recovery()
+                    current_translation, current_rotation = get_current_pose(robot)
+                except Exception as recovery_error:
+                    logging.error(f"Error recovery failed: {recovery_error}")
+                    break
+            except Exception as e:
+                logging.error(f"Unexpected error during action execution: {e}")
+                logging.error(traceback.format_exc())
 
         # print("end of ", img_i)
         # break
